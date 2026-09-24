@@ -1,11 +1,34 @@
-import { useEffect, useState } from 'react'
-import type { FormEvent } from 'react'
+import { Component, useEffect, useState } from 'react'
+import type { ErrorInfo, FormEvent, ReactNode } from 'react'
 import { BrowserRouter, Navigate, Route, Routes, useNavigate } from 'react-router-dom'
 import type { Session } from '@supabase/supabase-js'
 import { isSupabaseConfigured, supabase } from './lib/supabase.js'
 import './App.css'
 
 type Habit = { id: number; name: string; color: string; created_at: string; completed: boolean }
+const MAX_AVATAR_SIZE = 1024 * 1024
+
+type ErrorBoundaryProps = { section: string; children: ReactNode }
+type ErrorBoundaryState = { hasError: boolean }
+
+class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { hasError: false }
+
+  static getDerivedStateFromError(): ErrorBoundaryState {
+    return { hasError: true }
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error(`Error in ${this.props.section}`, error, info)
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return <div className="section-fallback"><strong>{this.props.section} unavailable</strong><button className="text-button" onClick={() => this.setState({ hasError: false })}>Try again</button></div>
+    }
+    return this.props.children
+  }
+}
 
 function App() {
   const [session, setSession] = useState<Session | null>(null)
@@ -59,6 +82,62 @@ function AuthPage() {
       <form onSubmit={handleSubmit}><label>Email<input required type="email" value={email} onChange={(event) => setEmail(event.target.value)} /></label><label>Password<input required minLength={6} type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>{error && <p className="notice error">{error}</p>}{message && <p className="notice success">{message}</p>}<button className="primary-button" disabled={loading || !isSupabaseConfigured} type="submit">{loading ? 'Working...' : mode === 'sign-in' ? 'Enter your day' : 'Start tracking'}</button></form>
     </section>
   </main>
+}
+
+function AvatarUploader({ userId }: { userId: string }) {
+  const [avatarUrl, setAvatarUrl] = useState('')
+  const [previewUrl, setPreviewUrl] = useState('')
+  const [error, setError] = useState('')
+  const [uploading, setUploading] = useState(false)
+  const [fileName, setFileName] = useState('')
+  const [dragActive, setDragActive] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    async function loadProfile() {
+      if (!supabase) return
+      const { data, error: queryError } = await supabase.from('profiles').select('avatar_url').eq('id', userId).maybeSingle()
+      if (active && queryError) setError(queryError.message)
+      if (active && data?.avatar_url) setAvatarUrl(data.avatar_url)
+    }
+    void loadProfile()
+    return () => { active = false }
+  }, [userId])
+
+  async function uploadAvatar(file: File) {
+    if (!supabase) return
+    setUploading(true); setError('')
+    const path = `${userId}/avatar`
+    const { error: uploadError } = await supabase.storage.from('avatars').upload(path, file, { upsert: true, contentType: file.type })
+    if (uploadError) { setError(`Avatar upload failed: ${uploadError.message}`); setUploading(false); return }
+    const { data: publicData } = supabase.storage.from('avatars').getPublicUrl(path)
+    const { error: profileError } = await supabase.from('profiles').upsert({ id: userId, avatar_url: publicData.publicUrl, updated_at: new Date().toISOString() }).select('id, avatar_url').single()
+    if (profileError) setError(`Profile save failed: ${profileError.message}`)
+    else setAvatarUrl(`${publicData.publicUrl}?v=${Date.now()}`)
+    setUploading(false)
+  }
+
+  function processFile(file: File | undefined) {
+    if (!file) return
+    if (!file.type.startsWith('image/')) { setError('Choose an image file.'); setPreviewUrl(''); return }
+    if (file.size > MAX_AVATAR_SIZE) { setError('Images must be 1 MB or smaller.'); setPreviewUrl(''); return }
+    setError(''); setFileName(file.name)
+    setPreviewUrl(URL.createObjectURL(file))
+    void uploadAvatar(file)
+  }
+
+  function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) { processFile(event.target.files?.[0]) }
+
+  const displayUrl = previewUrl || avatarUrl
+  return <div className={`avatar-uploader ${dragActive ? 'is-dragging' : ''}`} onDragEnter={() => setDragActive(true)} onDragOver={(event) => event.preventDefault()} onDragLeave={() => setDragActive(false)} onDrop={(event) => { event.preventDefault(); setDragActive(false); processFile(event.dataTransfer.files[0]) }}>
+    <div className="avatar-frame">{displayUrl ? <img src={displayUrl} alt="Your profile avatar" /> : <span>{userId.slice(0, 2).toUpperCase()}</span>}</div>
+    <div className="avatar-copy"><div className="avatar-heading"><span>Profile image</span><span className="avatar-status">{uploading ? 'Uploading' : 'Ready'}</span></div><p className="avatar-hint">Drop an image here, or choose one</p><label className="avatar-button" htmlFor="avatar-file">Choose image</label><input className="avatar-input" id="avatar-file" accept="image/*" type="file" onChange={handleFileChange} /><p className="avatar-meta">{fileName || 'JPG, PNG, or GIF · max 1 MB'}</p>{error && <p className="notice error avatar-error">{error}</p>}</div>
+  </div>
+}
+
+// TEMPORARY: remove this component after capturing the ErrorBoundary screenshot.
+function BoundaryCrash(): ReactNode {
+  throw new Error('Boundary test')
 }
 
 function Tracker({ session }: { session: Session }) {
@@ -131,13 +210,13 @@ function Tracker({ session }: { session: Session }) {
   async function signOut() { await supabase?.auth.signOut(); navigate('/login') }
 
   return <main className="tracker-shell">
-    <header className="topbar"><div className="brand"><span className="mark">D</span><span>daymark</span></div><button className="text-button" onClick={signOut}>Sign out</button></header>
-    <section className="tracker-intro"><div><p className="eyebrow">{new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</p><h1>Your everyday,<br /><em>made tangible.</em></h1></div><div className="streak"><strong>{habits.length}</strong><span>active<br />rhythms</span></div></section>
-    <section className="habit-section"><div className="section-heading"><div><p className="eyebrow">Your habits</p><h2>Keep showing up.</h2></div><span className="habit-count">{habits.length.toString().padStart(2, '0')}</span></div>
+    <ErrorBoundary section="Navigation"><header className="topbar"><div className="brand"><span className="mark">D</span><span>daymark</span></div><button className="text-button" onClick={signOut}>Sign out</button></header></ErrorBoundary>
+    <ErrorBoundary section="Stats"><section className="tracker-intro"><BoundaryCrash /><div><p className="eyebrow">{new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</p><h1>Your everyday,<br /><em>made tangible.</em></h1></div><div className="stats-side"><div className="streak"><strong>{habits.length}</strong><span>active<br />rhythms</span></div><AvatarUploader userId={userId} /></div></section></ErrorBoundary>
+    <ErrorBoundary section="Habit list"><section className="habit-section"><div className="section-heading"><div><p className="eyebrow">Your habits</p><h2>Keep showing up.</h2></div><span className="habit-count">{habits.length.toString().padStart(2, '0')}</span></div>
       <form className="add-form" onSubmit={addHabit}><input aria-label="New habit" placeholder="What will you practice?" value={newHabit} onChange={(event) => setNewHabit(event.target.value)} /><button className="primary-button" disabled={saving || !newHabit.trim()} type="submit">Add habit <span>+</span></button></form>
       {error && <p className="notice error">{error}</p>}
       {loading ? <p className="empty-state">Gathering your rhythms...</p> : habits.length === 0 ? <div className="empty-state"><span className="empty-mark">○</span><p>No habits yet. Start with one small promise.</p></div> : <div className="habit-list">{habits.map((habit, index) => <article className={`habit-row ${habit.completed ? 'completed' : ''}`} key={habit.id}><button className="complete-button" disabled={saving} onClick={() => void toggleHabit(habit)} type="button" aria-label={`${habit.completed ? 'Uncomplete' : 'Complete'} ${habit.name}`}>{habit.completed ? '✓' : ''}</button><span className="habit-number">0{index + 1}</span><span className="habit-dot" style={{ backgroundColor: habit.color }}></span>{editingId === habit.id ? <input className="edit-input" autoFocus value={editingName} onChange={(event) => setEditingName(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void updateHabit(habit, editingName); if (event.key === 'Escape') setEditingId(null) }} /> : <span className="habit-name">{habit.name}</span>}<div className="habit-actions">{editingId === habit.id ? <button className="icon-button" disabled={saving} onClick={() => void updateHabit(habit, editingName)} type="button" aria-label="Save habit">✓</button> : <button className="icon-button" onClick={() => { setEditingId(habit.id); setEditingName(habit.name) }} type="button" aria-label={`Edit ${habit.name}`}>✎</button>}<button className="icon-button danger-button" disabled={saving} onClick={() => void deleteHabit(habit)} type="button" aria-label={`Delete ${habit.name}`}>×</button></div></article>)}</div>}
-    </section>
+    </section></ErrorBoundary>
     <footer className="footer-note">Your data belongs to you · {session.user.email}</footer>
   </main>
 }
