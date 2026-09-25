@@ -23,7 +23,7 @@ export default defineConfig({
       ],
     },
     workbox: {
-      navigateFallback: '/',
+      navigateFallback: 'index.html',
       runtimeCaching: [
         { urlPattern: ({ request }) => request.destination === 'image', handler: 'CacheFirst', options: { cacheName: 'daymark-images', expiration: { maxEntries: 40, maxAgeSeconds: 60 * 60 * 24 * 30 } } },
         { urlPattern: ({ url }) => url.hostname.endsWith('supabase.co'), handler: 'NetworkFirst', options: { cacheName: 'daymark-api', networkTimeoutSeconds: 3, expiration: { maxEntries: 60, maxAgeSeconds: 60 * 5 } } },
