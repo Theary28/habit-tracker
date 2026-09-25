@@ -3,9 +3,11 @@ import type { ErrorInfo, FormEvent, ReactNode } from 'react'
 import { BrowserRouter, Navigate, Route, Routes, useNavigate } from 'react-router-dom'
 import type { Session } from '@supabase/supabase-js'
 import { isSupabaseConfigured, supabase } from './lib/supabase.js'
+import { flushPendingHabits, getPendingHabits, queueHabit } from './offlineQueue.js'
+import { OfflineBanner, UpdateToast } from './pwa.js'
 import './App.css'
 
-type Habit = { id: number; name: string; color: string; created_at: string; completed: boolean }
+type Habit = { id: number; name: string; color: string; created_at: string; completed: boolean; pendingId?: string }
 const MAX_AVATAR_SIZE = 1024 * 1024
 
 type ErrorBoundaryProps = { section: string; children: ReactNode }
@@ -33,6 +35,15 @@ class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
 function App() {
   const [session, setSession] = useState<Session | null>(null)
   const [authLoading, setAuthLoading] = useState(isSupabaseConfigured)
+  const [offline, setOffline] = useState(() => !navigator.onLine)
+
+  useEffect(() => {
+    const setOnline = () => setOffline(false)
+    const setOfflineState = () => setOffline(true)
+    window.addEventListener('online', setOnline)
+    window.addEventListener('offline', setOfflineState)
+    return () => { window.removeEventListener('online', setOnline); window.removeEventListener('offline', setOfflineState) }
+  }, [])
 
   useEffect(() => {
     if (!supabase) return
@@ -42,11 +53,11 @@ function App() {
   }, [])
 
   if (authLoading) return <div className="loading-screen">Loading your space...</div>
-  return <BrowserRouter><Routes>
+  return <><OfflineBanner offline={offline} /><UpdateToast /><BrowserRouter><Routes>
     <Route path="/login" element={session ? <Navigate to="/" replace /> : <AuthPage />} />
     <Route path="/" element={<ProtectedRoute session={session}>{session && <Tracker session={session} />}</ProtectedRoute>} />
     <Route path="*" element={<Navigate to={session ? '/' : '/login'} replace />} />
-  </Routes></BrowserRouter>
+  </Routes></BrowserRouter></>
 }
 
 function ProtectedRoute({ session, children }: { session: Session | null; children: React.ReactNode }) {
@@ -135,11 +146,6 @@ function AvatarUploader({ userId }: { userId: string }) {
   </div>
 }
 
-// TEMPORARY: remove this component after capturing the ErrorBoundary screenshot.
-function BoundaryCrash(): ReactNode {
-  throw new Error('Boundary test')
-}
-
 function Tracker({ session }: { session: Session }) {
   const [habits, setHabits] = useState<Habit[]>([])
   const [newHabit, setNewHabit] = useState('')
@@ -147,6 +153,7 @@ function Tracker({ session }: { session: Session }) {
   const [editingName, setEditingName] = useState('')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [shareStatus, setShareStatus] = useState('')
   const [error, setError] = useState('')
   const navigate = useNavigate()
   const userId = session.user.id
@@ -164,7 +171,9 @@ function Tracker({ session }: { session: Session }) {
         if (queryError || logsError) setError((queryError ?? logsError)?.message ?? 'Unable to load your habits.')
         else {
           const completedIds = new Set((logs ?? []).filter((log) => log.completed).map((log) => log.habit_id))
-          setHabits((data ?? []).map((habit) => ({ ...habit, completed: completedIds.has(habit.id) })))
+          const savedHabits = (data ?? []).map((habit) => ({ ...habit, completed: completedIds.has(habit.id) }))
+          const queuedHabits = getPendingHabits(userId).map((habit, index) => ({ id: -(index + 1), name: habit.name, color: '#e58b54', created_at: habit.createdAt, completed: false, pendingId: habit.clientId }))
+          setHabits([...savedHabits, ...queuedHabits])
         }
         setLoading(false)
       }
@@ -173,9 +182,27 @@ function Tracker({ session }: { session: Session }) {
     return () => { active = false }
   }, [userId])
 
+  useEffect(() => {
+    async function syncQueuedHabits() {
+      const synced = await flushPendingHabits(userId)
+      if (synced.length) setHabits((current) => current.map((habit) => {
+        const match = synced.find((item) => item.pending.clientId === habit.pendingId)
+        return match ? { ...match.saved, completed: false } : habit
+      }))
+    }
+    window.addEventListener('online', syncQueuedHabits)
+    if (navigator.onLine) void syncQueuedHabits()
+    return () => window.removeEventListener('online', syncQueuedHabits)
+  }, [userId])
+
   async function addHabit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const name = newHabit.trim(); if (!supabase || !name) return
     setSaving(true); setError('')
+    if (!navigator.onLine) {
+      const pending = queueHabit(userId, name)
+      setHabits((current) => [...current, { id: -Date.now(), name, color: '#e58b54', created_at: pending.createdAt, completed: false, pendingId: pending.clientId }])
+      setNewHabit(''); setSaving(false); return
+    }
     const { data, error: queryError } = await supabase.from('habits').insert({ name, user_id: userId }).select('id, name, color, created_at').single()
     if (queryError) setError(queryError.message); else if (data) { setHabits((current) => [...current, { ...data, completed: false }]); setNewHabit('') }
     setSaving(false)
@@ -209,15 +236,33 @@ function Tracker({ session }: { session: Session }) {
 
   async function signOut() { await supabase?.auth.signOut(); navigate('/login') }
 
+  async function shareHabits() {
+    const text = `Daymark: ${habits.length} active habit${habits.length === 1 ? '' : 's'}.`
+    try {
+      if (navigator.share) { await navigator.share({ title: 'Daymark', text, url: window.location.origin }); return }
+      if (navigator.clipboard) await navigator.clipboard.writeText(`${text} ${window.location.origin}`)
+      else {
+        const fallback = document.createElement('textarea')
+        fallback.value = `${text} ${window.location.origin}`; document.body.appendChild(fallback); fallback.select(); document.execCommand('copy'); fallback.remove()
+      }
+      setShareStatus('Copied to clipboard')
+    } catch (shareError) {
+      // Closing the native share sheet rejects with AbortError; that is not a failure worth reporting
+      if (shareError instanceof DOMException && shareError.name === 'AbortError') return
+      setShareStatus('Unable to share right now')
+    }
+    window.setTimeout(() => setShareStatus(''), 2500)
+  }
+
   return <main className="tracker-shell">
     <ErrorBoundary section="Navigation"><header className="topbar"><div className="brand"><span className="mark">D</span><span>daymark</span></div><button className="text-button" onClick={signOut}>Sign out</button></header></ErrorBoundary>
-    <ErrorBoundary section="Stats"><section className="tracker-intro"><BoundaryCrash /><div><p className="eyebrow">{new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</p><h1>Your everyday,<br /><em>made tangible.</em></h1></div><div className="stats-side"><div className="streak"><strong>{habits.length}</strong><span>active<br />rhythms</span></div><AvatarUploader userId={userId} /></div></section></ErrorBoundary>
+    <ErrorBoundary section="Stats"><section className="tracker-intro"><div><p className="eyebrow">{new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</p><h1>Your everyday,<br /><em>made tangible.</em></h1></div><div className="stats-side"><div className="streak"><strong>{habits.length}</strong><span>active<br />rhythms</span></div><AvatarUploader userId={userId} /></div></section></ErrorBoundary>
     <ErrorBoundary section="Habit list"><section className="habit-section"><div className="section-heading"><div><p className="eyebrow">Your habits</p><h2>Keep showing up.</h2></div><span className="habit-count">{habits.length.toString().padStart(2, '0')}</span></div>
       <form className="add-form" onSubmit={addHabit}><input aria-label="New habit" placeholder="What will you practice?" value={newHabit} onChange={(event) => setNewHabit(event.target.value)} /><button className="primary-button" disabled={saving || !newHabit.trim()} type="submit">Add habit <span>+</span></button></form>
       {error && <p className="notice error">{error}</p>}
-      {loading ? <p className="empty-state">Gathering your rhythms...</p> : habits.length === 0 ? <div className="empty-state"><span className="empty-mark">○</span><p>No habits yet. Start with one small promise.</p></div> : <div className="habit-list">{habits.map((habit, index) => <article className={`habit-row ${habit.completed ? 'completed' : ''}`} key={habit.id}><button className="complete-button" disabled={saving} onClick={() => void toggleHabit(habit)} type="button" aria-label={`${habit.completed ? 'Uncomplete' : 'Complete'} ${habit.name}`}>{habit.completed ? '✓' : ''}</button><span className="habit-number">0{index + 1}</span><span className="habit-dot" style={{ backgroundColor: habit.color }}></span>{editingId === habit.id ? <input className="edit-input" autoFocus value={editingName} onChange={(event) => setEditingName(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void updateHabit(habit, editingName); if (event.key === 'Escape') setEditingId(null) }} /> : <span className="habit-name">{habit.name}</span>}<div className="habit-actions">{editingId === habit.id ? <button className="icon-button" disabled={saving} onClick={() => void updateHabit(habit, editingName)} type="button" aria-label="Save habit">✓</button> : <button className="icon-button" onClick={() => { setEditingId(habit.id); setEditingName(habit.name) }} type="button" aria-label={`Edit ${habit.name}`}>✎</button>}<button className="icon-button danger-button" disabled={saving} onClick={() => void deleteHabit(habit)} type="button" aria-label={`Delete ${habit.name}`}>×</button></div></article>)}</div>}
+      {loading ? <p className="empty-state">Gathering your rhythms...</p> : habits.length === 0 ? <div className="empty-state"><span className="empty-mark">○</span><p>No habits yet. Start with one small promise.</p></div> : <div className="habit-list">{habits.map((habit, index) => <article className={`habit-row ${habit.completed ? 'completed' : ''} ${habit.pendingId ? 'queued' : ''}`} key={habit.pendingId ?? habit.id}><button className="complete-button" disabled={saving || !!habit.pendingId} onClick={() => void toggleHabit(habit)} type="button" aria-label={`${habit.completed ? 'Uncomplete' : 'Complete'} ${habit.name}`}>{habit.completed ? '✓' : ''}</button><span className="habit-number">0{index + 1}</span><span className="habit-dot" style={{ backgroundColor: habit.color }}></span>{editingId === habit.id ? <input className="edit-input" autoFocus value={editingName} onChange={(event) => setEditingName(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void updateHabit(habit, editingName); if (event.key === 'Escape') setEditingId(null) }} /> : <span className="habit-name">{habit.name}{habit.pendingId && <span className="queued-badge">Queued · syncs when online</span>}</span>}<div className="habit-actions">{editingId === habit.id ? <button className="icon-button" disabled={saving} onClick={() => void updateHabit(habit, editingName)} type="button" aria-label="Save habit">✓</button> : <button className="icon-button" disabled={!!habit.pendingId} onClick={() => { setEditingId(habit.id); setEditingName(habit.name) }} type="button" aria-label={`Edit ${habit.name}`}>✎</button>}<button className="icon-button danger-button" disabled={saving || !!habit.pendingId} onClick={() => void deleteHabit(habit)} type="button" aria-label={`Delete ${habit.name}`}>×</button></div></article>)}</div>}
     </section></ErrorBoundary>
-    <footer className="footer-note">Your data belongs to you · {session.user.email}</footer>
+    <footer className="footer-note"><span>Your data belongs to you · {session.user.email}</span><span className="share-group"><span className="share-status" role="status">{shareStatus}</span><button className="share-button" type="button" onClick={() => void shareHabits()}>Share</button></span></footer>
   </main>
 }
 
