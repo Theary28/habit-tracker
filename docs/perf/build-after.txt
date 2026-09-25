@@ -1,0 +1,24 @@
+
+> habit-tracker@0.0.0 build
+> tsc -b && vite build
+
+vite v8.3.0 building client environment for production...
+transforming...
+✓ 67 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                                    0.88 kB │ gzip:   0.45 kB
+dist/manifest.webmanifest                          1.10 kB
+dist/assets/index-7_hwwQ77.css                     8.58 kB │ gzip:   2.63 kB
+dist/assets/workbox-window.prod.es5-Bd17z0YL.js    5.65 kB │ gzip:   2.20 kB
+dist/assets/Tracker-NpUtrQG1.js                   10.36 kB │ gzip:   3.63 kB
+dist/assets/index-Cxj05DYH.js                    440.84 kB │ gzip: 125.74 kB
+
+✓ built in 246ms
+
+PWA v1.3.0
+mode      generateSW
+precache  20 entries (455.41 KiB)
+files generated
+  dist/sw.js
+  dist/workbox-3a3a58c4.js

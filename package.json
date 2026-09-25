@@ -14,7 +14,6 @@
     "@supabase/supabase-js": "^2.117.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "react-router-dom": "^7.18.4",
     "workbox-window": "^7.4.1"
   },
   "devDependencies": {
